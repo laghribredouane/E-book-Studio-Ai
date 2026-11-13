@@ -17,6 +17,8 @@ export const DEFAULT_AI_COSTS: Record<string, number> = {
   change_tone: 3,
   proofread: 8,
   generate_image: 15,
+  writer_chat: 1,
+  from_image: 10,
 };
 
 export async function getAiCosts(): Promise<Record<string, number>> {

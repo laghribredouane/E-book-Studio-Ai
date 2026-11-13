@@ -1,10 +1,9 @@
 import 'dotenv/config';
 import express from 'express';
 import path from 'node:path';
-import { createServer as createViteServer } from 'vite';
 import { apiRouter } from './src/routes/api.ts';
 
-const PORT = 3000;
+const PORT = Number(process.env.PORT || 3000);
 
 async function startServer() {
   const app = express();
@@ -16,6 +15,7 @@ async function startServer() {
   app.use('/api', apiRouter);
 
   if (process.env.NODE_ENV !== 'production') {
+    const { createServer: createViteServer } = await import('vite');
     const vite = await createViteServer({
       server: { middlewareMode: true },
       appType: 'spa',
@@ -23,6 +23,8 @@ async function startServer() {
     app.use(vite.middlewares);
   } else {
     const distPath = path.resolve(process.cwd(), 'dist');
+    const assetsPath = path.resolve(process.cwd(), 'src/assets');
+    app.use('/src/assets', express.static(assetsPath));
     app.use(express.static(distPath));
     app.get('*', (_req, res) => {
       res.sendFile(path.join(distPath, 'index.html'));

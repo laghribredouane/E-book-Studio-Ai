@@ -31,6 +31,8 @@ export const PublicLibraryPage: React.FC = () => {
         const data = await res.json();
         setBooks(data.books || []);
       }
+    } catch {
+      setBooks([]);
     } finally {
       setLoading(false);
     }

@@ -28,7 +28,7 @@ export interface LayoutConfig {
   pageFormat: 'A4' | 'A5' | 'Letter';
   marginMm: number;
   lineHeight: number;
-  fontFamily: 'serif' | 'sans';
+  fontFamily: 'serif' | 'sans' | 'mono';
   fontSizePt: number;
   showHeader: boolean;
   showFooter: boolean;

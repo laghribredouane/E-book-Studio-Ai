@@ -10,9 +10,12 @@ import {
   Paragraph,
   TextRun,
 } from 'docx';
+import fsSync from 'node:fs';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import type { CoverConfig, LayoutConfig } from '../db/schema.ts';
+
+export type PdfStandard = 'standard' | 'PDF/A-1b' | 'PDF/A-2b' | 'PDF/A-3b';
 
 export interface ExportBookPayload {
   id: string;
@@ -24,6 +27,7 @@ export interface ExportBookPayload {
   coverImageUrl: string | null;
   coverConfig: CoverConfig;
   layoutConfig: LayoutConfig;
+  pdfStandard?: PdfStandard;
   chapters: Array<{
     chapterNumber: number;
     title: string;
@@ -137,32 +141,116 @@ function sanitizeHtmlForXhtml(html: string): string {
     .replace(/&nbsp;/gi, '&#160;');
 }
 
+function resolveEmbeddedFontSet(family: 'serif' | 'sans' | 'mono'): {
+  body: string;
+  bold: string;
+  italic: string;
+} | null {
+  const candidates: Record<
+    'serif' | 'sans' | 'mono',
+    Array<{ body: string; bold: string; italic: string }>
+  > = {
+    serif: [
+      {
+        body: '/usr/share/fonts/truetype/liberation/LiberationSerif-Regular.ttf',
+        bold: '/usr/share/fonts/truetype/liberation/LiberationSerif-Bold.ttf',
+        italic: '/usr/share/fonts/truetype/liberation/LiberationSerif-Italic.ttf',
+      },
+      {
+        body: '/usr/share/fonts/truetype/dejavu/DejaVuSerif.ttf',
+        bold: '/usr/share/fonts/truetype/dejavu/DejaVuSerif-Bold.ttf',
+        italic: '/usr/share/fonts/truetype/dejavu/DejaVuSerif.ttf',
+      },
+    ],
+    sans: [
+      {
+        body: '/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf',
+        bold: '/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf',
+        italic: '/usr/share/fonts/truetype/liberation/LiberationSans-Italic.ttf',
+      },
+      {
+        body: '/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf',
+        bold: '/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf',
+        italic: '/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf',
+      },
+    ],
+    mono: [
+      {
+        body: '/usr/share/fonts/truetype/liberation/LiberationMono-Regular.ttf',
+        bold: '/usr/share/fonts/truetype/liberation/LiberationMono-Bold.ttf',
+        italic: '/usr/share/fonts/truetype/liberation/LiberationMono-Italic.ttf',
+      },
+      {
+        body: '/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf',
+        bold: '/usr/share/fonts/truetype/dejavu/DejaVuSansMono-Bold.ttf',
+        italic: '/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf',
+      },
+    ],
+  };
+
+  for (const set of candidates[family] || candidates.serif) {
+    if (fsSync.existsSync(set.body) && fsSync.existsSync(set.bold) && fsSync.existsSync(set.italic)) {
+      return set;
+    }
+  }
+  return null;
+}
+
 export async function generatePdfBuffer(book: ExportBookPayload): Promise<Buffer> {
   const layout = book.layoutConfig;
-  const marginPt = Math.max(28, Math.round((layout.marginMm || 20) * 2.83465));
+  const clampedMarginMm = Math.min(40, Math.max(10, Number(layout.marginMm || 20)));
+  const marginPt = Math.round(clampedMarginMm * 2.83465);
   const sizeMap: Record<string, string> = {
     A4: 'A4',
     A5: 'A5',
     Letter: 'LETTER',
   };
 
+  const pdfSubset =
+    book.pdfStandard && book.pdfStandard !== 'standard' ? book.pdfStandard : undefined;
+  const pdfVersion =
+    pdfSubset === 'PDF/A-1b' ? '1.4' : pdfSubset ? '1.7' : undefined;
+
   const doc = new PDFDocument({
     size: sizeMap[layout.pageFormat] || 'A4',
     margins: { top: marginPt + 14, bottom: marginPt + 14, left: marginPt, right: marginPt },
     bufferPages: true,
+    ...(pdfSubset ? { subset: pdfSubset, pdfVersion, displayTitle: true, lang: book.languageCode || 'fr' } : {}),
     info: {
-      Title: book.title,
-      Author: book.authorName,
+      Title: pdfSubset ? escapeXml(book.title) : book.title,
+      Author: pdfSubset ? escapeXml(book.authorName) : book.authorName,
+      Subject: pdfSubset ? escapeXml(book.subtitle || book.description || book.title) : book.subtitle || '',
       Creator: 'EBOOK STUDIO AI',
+      Producer: pdfSubset ? `EBOOK STUDIO AI (${pdfSubset})` : 'EBOOK STUDIO AI',
     },
   });
 
   const chunks: Buffer[] = [];
   doc.on('data', (chunk: Buffer) => chunks.push(chunk));
 
-  const bodyFont = layout.fontFamily === 'sans' ? 'Helvetica' : 'Times-Roman';
-  const boldFont = layout.fontFamily === 'sans' ? 'Helvetica-Bold' : 'Times-Bold';
-  const italicFont = layout.fontFamily === 'sans' ? 'Helvetica-Oblique' : 'Times-Italic';
+  const fallbackFontMap = {
+    serif: { body: 'Times-Roman', bold: 'Times-Bold', italic: 'Times-Italic' },
+    sans: { body: 'Helvetica', bold: 'Helvetica-Bold', italic: 'Helvetica-Oblique' },
+    mono: { body: 'Courier', bold: 'Courier-Bold', italic: 'Courier-Oblique' },
+  } as const;
+
+  const activeFamily =
+    layout.fontFamily === 'sans' || layout.fontFamily === 'mono' ? layout.fontFamily : 'serif';
+  const ttfPaths = resolveEmbeddedFontSet(activeFamily);
+
+  let bodyFont: string = fallbackFontMap[activeFamily].body;
+  let boldFont: string = fallbackFontMap[activeFamily].bold;
+  let italicFont: string = fallbackFontMap[activeFamily].italic;
+
+  if (ttfPaths) {
+    doc.registerFont('EmbedBody', ttfPaths.body);
+    doc.registerFont('EmbedBold', ttfPaths.bold);
+    doc.registerFont('EmbedItalic', ttfPaths.italic);
+    bodyFont = 'EmbedBody';
+    boldFont = 'EmbedBold';
+    italicFont = 'EmbedItalic';
+  }
+
   const fontSize = layout.fontSizePt || 11;
   const lineGap = Math.max(2, Math.round((layout.lineHeight - 1) * fontSize));
 
@@ -175,15 +263,27 @@ export async function generatePdfBuffer(book: ExportBookPayload): Promise<Buffer
     doc.rect(0, 0, doc.page.width, doc.page.height).fill(bgHex);
 
     const coverImg = await resolveImageBuffer(book.coverImageUrl);
+    const isPdfA1 = pdfSubset === 'PDF/A-1b';
+    let titleStartY = 160;
+
     if (coverImg) {
       try {
-        doc.save();
-        doc.opacity(0.32);
-        doc.image(coverImg.buffer, 0, 0, {
-          width: doc.page.width,
-          height: doc.page.height,
-        });
-        doc.restore();
+        if (isPdfA1) {
+          // ISO 19005-1 (PDF/A-1b) forbids alpha transparency; render cover artwork in a clean opaque frame
+          doc.image(coverImg.buffer, marginPt, 112, {
+            fit: [doc.page.width - marginPt * 2, 175],
+            align: 'center',
+          });
+          titleStartY = 308;
+        } else {
+          doc.save();
+          doc.opacity(0.32);
+          doc.image(coverImg.buffer, 0, 0, {
+            width: doc.page.width,
+            height: doc.page.height,
+          });
+          doc.restore();
+        }
       } catch {
         // Ignore non-PNG/JPEG cover image issues
       }
@@ -191,17 +291,18 @@ export async function generatePdfBuffer(book: ExportBookPayload): Promise<Buffer
 
     doc
       .fillColor(accentHex)
-      .font('Helvetica-Bold')
+      .font(boldFont)
       .fontSize(11)
-      .text((book.coverConfig?.badgeText || 'EBOOK STUDIO EDITION').toUpperCase(), marginPt, 84, {
+      .text((book.coverConfig?.badgeText || 'EBOOK STUDIO EDITION').toUpperCase(), marginPt, 78, {
+        width: doc.page.width - marginPt * 2,
         align: book.coverConfig?.titleAlign || 'left',
       });
 
     doc
       .fillColor(textHex)
       .font(boldFont)
-      .fontSize(32)
-      .text(book.title, marginPt, 160, {
+      .fontSize(isPdfA1 && coverImg ? 26 : 32)
+      .text(book.title, marginPt, titleStartY, {
         width: doc.page.width - marginPt * 2,
         align: book.coverConfig?.titleAlign || 'left',
       });
@@ -211,7 +312,7 @@ export async function generatePdfBuffer(book: ExportBookPayload): Promise<Buffer
       doc
         .fillColor(textHex)
         .font(italicFont)
-        .fontSize(16)
+        .fontSize(15)
         .text(book.subtitle, {
           width: doc.page.width - marginPt * 2,
           align: book.coverConfig?.titleAlign || 'left',
@@ -226,7 +327,7 @@ export async function generatePdfBuffer(book: ExportBookPayload): Promise<Buffer
     if (book.coverConfig?.showAuthor !== false) {
       doc
         .fillColor(textHex)
-        .font('Helvetica-Bold')
+        .font(boldFont)
         .fontSize(14)
         .text(book.authorName, marginPt, doc.page.height - 115, {
           width: doc.page.width - marginPt * 2,
@@ -270,7 +371,7 @@ export async function generatePdfBuffer(book: ExportBookPayload): Promise<Buffer
 
     doc
       .fillColor('#6D28D9')
-      .font('Helvetica-Bold')
+      .font(boldFont)
       .fontSize(10)
       .text(`CHAPITRE ${ch.chapterNumber}`);
     doc.moveDown(0.25);
@@ -340,6 +441,8 @@ export async function generatePdfBuffer(book: ExportBookPayload): Promise<Buffer
   // 4. Headers, Footers, Page Numbers
   const range = doc.bufferedPageRange();
   const startPage = layout.includeCoverPage ? 1 : 0;
+  const headerY = Math.max(14, Math.round((marginPt + 14) * 0.45));
+  const footerY = doc.page.height - Math.max(22, Math.round((marginPt + 14) * 0.55));
   for (let i = startPage; i < range.count; i++) {
     doc.switchToPage(i);
     const oldBottomMargin = doc.page.margins.bottom;
@@ -348,9 +451,9 @@ export async function generatePdfBuffer(book: ExportBookPayload): Promise<Buffer
     if (layout.showHeader) {
       doc
         .fillColor('#64748B')
-        .font('Helvetica')
+        .font(bodyFont)
         .fontSize(8.5)
-        .text(book.title, marginPt, 24, {
+        .text(book.title, marginPt, headerY, {
           width: doc.page.width - marginPt * 2,
           align: 'right',
         });
@@ -359,16 +462,15 @@ export async function generatePdfBuffer(book: ExportBookPayload): Promise<Buffer
     if (layout.showFooter || layout.showPageNumbers) {
       const footerLeft = layout.showFooter ? book.authorName : '';
       const footerRight = layout.showPageNumbers ? `${i + 1} / ${range.count}` : '';
-      const y = doc.page.height - 32;
       if (footerLeft) {
-        doc.fillColor('#64748B').font('Helvetica').fontSize(8.5).text(footerLeft, marginPt, y);
+        doc.fillColor('#64748B').font(bodyFont).fontSize(8.5).text(footerLeft, marginPt, footerY);
       }
       if (footerRight) {
         doc
           .fillColor('#475569')
-          .font('Helvetica')
+          .font(bodyFont)
           .fontSize(8.5)
-          .text(footerRight, marginPt, y, {
+          .text(footerRight, marginPt, footerY, {
             width: doc.page.width - marginPt * 2,
             align: 'right',
           });
@@ -419,7 +521,13 @@ export async function generateEpubBuffer(book: ExportBookPayload): Promise<Buffe
   oebps.file(
     'styles.css',
     `body {
-  font-family: ${book.layoutConfig.fontFamily === 'sans' ? 'sans-serif' : 'Georgia, serif'};
+  font-family: ${
+    book.layoutConfig.fontFamily === 'sans'
+      ? 'sans-serif'
+      : book.layoutConfig.fontFamily === 'mono'
+        ? 'monospace'
+        : 'Georgia, serif'
+  };
   line-height: ${book.layoutConfig.lineHeight || 1.65};
   margin: 1.5em;
   color: #111827;
@@ -609,7 +717,11 @@ export async function generateHtmlString(book: ExportBookPayload): Promise<strin
   <title>${escapeXml(book.title)}</title>
   <style>
     body { max-width: 760px; margin: 3rem auto; padding: 0 1.5rem; font-family: ${
-      book.layoutConfig.fontFamily === 'sans' ? 'system-ui, sans-serif' : 'Georgia, serif'
+      book.layoutConfig.fontFamily === 'sans'
+        ? 'system-ui, sans-serif'
+        : book.layoutConfig.fontFamily === 'mono'
+          ? 'ui-monospace, SFMono-Regular, Menlo, monospace'
+          : 'Georgia, serif'
     }; line-height: ${book.layoutConfig.lineHeight || 1.7}; color: #0F172A; background: #FAFAF9; }
     .cover { padding: 4rem 2.5rem; border-radius: 16px; background: ${book.coverConfig.backgroundColor}; color: ${book.coverConfig.textColor}; margin-bottom: 3rem; text-align: ${book.coverConfig.titleAlign}; }
     .cover img { max-width: 280px; border-radius: 10px; margin-bottom: 1.5rem; }

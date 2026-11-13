@@ -7,7 +7,7 @@ export type AppRoute =
   | { name: 'dashboard' }
   | { name: 'my-library' }
   | { name: 'projects' }
-  | { name: 'studio'; bookId?: string; tab?: StudioTab }
+  | { name: 'studio'; bookId?: string; tab?: StudioTab; mode?: 'classic' | 'image' }
   | { name: 'illustrations' }
   | { name: 'templates' }
   | { name: 'favorites' }
@@ -43,7 +43,7 @@ export interface LayoutConfig {
   pageFormat: 'A4' | 'A5' | 'Letter';
   marginMm: number;
   lineHeight: number;
-  fontFamily: 'serif' | 'sans';
+  fontFamily: 'serif' | 'sans' | 'mono';
   fontSizePt: number;
   showHeader: boolean;
   showFooter: boolean;
@@ -51,6 +51,8 @@ export interface LayoutConfig {
   includeToc: boolean;
   includeCoverPage: boolean;
 }
+
+export type PdfStandard = 'standard' | 'PDF/A-1b' | 'PDF/A-2b' | 'PDF/A-3b';
 
 export interface Profile {
   id: string;

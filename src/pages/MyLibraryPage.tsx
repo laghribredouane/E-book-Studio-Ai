@@ -1,5 +1,5 @@
 import React, { useCallback, useEffect, useState } from 'react';
-import { BookOpen, Copy, Download, PenTool, Plus, Search, Trash2, Upload } from 'lucide-react';
+import { BookOpen, Copy, Download, Image as ImageIcon, PenTool, Plus, Search, Trash2, Upload } from 'lucide-react';
 import { useApp } from '../contexts/AppContext';
 import { DashboardShell } from '../components/DashboardShell';
 import { BookCoverPreview } from '../components/BookCoverPreview';
@@ -168,6 +168,14 @@ export const MyLibraryPage: React.FC<{ initialTab?: LibraryTab }> = ({ initialTa
           >
             <Upload className="h-3.5 w-3.5" />
             <span>Importer</span>
+          </button>
+          <button
+            type="button"
+            onClick={() => navigate({ name: 'studio', tab: 'setup', mode: 'image' })}
+            className="inline-flex items-center gap-1.5 rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 px-3 py-2 text-xs font-semibold hover:bg-slate-50 dark:hover:bg-slate-800 cursor-pointer whitespace-nowrap"
+          >
+            <ImageIcon className="h-3.5 w-3.5 text-[#6D28D9] dark:text-violet-400" />
+            <span className="hidden sm:inline">Depuis une image</span>
           </button>
           <button
             type="button"

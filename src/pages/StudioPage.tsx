@@ -14,13 +14,17 @@ import {
   PenTool,
   Plus,
   Save,
+  ShieldCheck,
   Sparkles,
   Trash2,
+  Upload,
   Wand2,
+  X,
 } from 'lucide-react';
 import { useApp } from '../contexts/AppContext';
 import { DashboardShell } from '../components/DashboardShell';
 import { BookCoverPreview } from '../components/BookCoverPreview';
+import { AiWriterAssistantPanel } from '../components/AiWriterAssistantPanel';
 import { STUDIO_COVER_ASSETS, STUDIO_ILLUSTRATION_ASSETS } from '../lib/studioAssets';
 import type {
   Book,
@@ -28,6 +32,7 @@ import type {
   BookImage,
   CoverConfig,
   LayoutConfig,
+  PdfStandard,
   ProofreadReport,
   StudioTab,
 } from '../types';
@@ -58,9 +63,14 @@ const DEFAULT_LAYOUT: LayoutConfig = {
   includeCoverPage: true,
 };
 
-export const StudioPage: React.FC<{ initialBookId?: string; initialTab?: StudioTab }> = ({
+export const StudioPage: React.FC<{
+  initialBookId?: string;
+  initialTab?: StudioTab;
+  initialMode?: 'classic' | 'image';
+}> = ({
   initialBookId,
   initialTab = 'setup',
+  initialMode = 'classic',
 }) => {
   const { apiFetch, bootstrap, navigate, notify, refreshBootstrap } = useApp();
 
@@ -86,6 +96,14 @@ export const StudioPage: React.FC<{ initialBookId?: string; initialTab?: StudioT
   const [formStyle, setFormStyle] = useState('Clair, structuré et engageant');
   const [formChaptersCount, setFormChaptersCount] = useState(6);
   const [formLength, setFormLength] = useState('medium');
+
+  // Image-Inspired eBook Generator State
+  const [setupMode, setSetupMode] = useState<'classic' | 'image'>(initialMode);
+  const [inspirationImage, setInspirationImage] = useState<string>('');
+  const [inspirationImageLabel, setInspirationImageLabel] = useState<string>('');
+  const [inspirationHint, setInspirationHint] = useState<string>('');
+  const [visualAnalysisNote, setVisualAnalysisNote] = useState<string | null>(null);
+  const imageFileInputRef = useRef<HTMLInputElement>(null);
 
   // Editor State
   const editorRef = useRef<HTMLDivElement>(null);
@@ -131,6 +149,7 @@ export const StudioPage: React.FC<{ initialBookId?: string; initialTab?: StudioT
 
   // Export State
   const [exportingFormat, setExportingFormat] = useState<string | null>(null);
+  const [exportPdfStandard, setExportPdfStandard] = useState<PdfStandard>('standard');
 
   useEffect(() => {
     setActiveTab(initialTab);
@@ -139,6 +158,16 @@ export const StudioPage: React.FC<{ initialBookId?: string; initialTab?: StudioT
   useEffect(() => {
     if (initialBookId) setActiveBookId(initialBookId);
   }, [initialBookId]);
+
+  useEffect(() => {
+    if (initialMode) {
+      setSetupMode(initialMode);
+      if (initialMode === 'image' && !initialBookId) {
+        setActiveBookId(undefined);
+        setActiveTab('setup');
+      }
+    }
+  }, [initialBookId, initialMode]);
 
   // Load user's projects list
   const loadMyBooksList = useCallback(async () => {
@@ -258,6 +287,125 @@ export const StudioPage: React.FC<{ initialBookId?: string; initialTab?: StudioT
 
     return () => clearTimeout(timer);
   }, [activeChapter, apiFetch, book, chapterHtmlDraft, chapterTitleDraft]);
+
+  const handleInspirationFileChange = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    if (!file.type.startsWith('image/')) {
+      notify('error', 'Veuillez sélectionner un fichier image (PNG, JPEG ou WebP).');
+      return;
+    }
+    if (file.size > 12_000_000) {
+      notify('error', 'Image trop volumineuse (max 12 Mo).');
+      return;
+    }
+
+    try {
+      const dataUrl = await new Promise<string>((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onerror = () => reject(new Error('Lecture du fichier impossible'));
+        reader.onload = () => resolve(String(reader.result || ''));
+        reader.readAsDataURL(file);
+      });
+
+      const resizedDataUrl = await new Promise<string>((resolve) => {
+        const img = new Image();
+        img.onerror = () => resolve(dataUrl);
+        img.onload = () => {
+          const maxDim = 1400;
+          if (img.width <= maxDim && img.height <= maxDim && dataUrl.length < 700_000) {
+            resolve(dataUrl);
+            return;
+          }
+          const scale = Math.min(1, maxDim / Math.max(img.width, img.height));
+          const canvas = document.createElement('canvas');
+          canvas.width = Math.max(1, Math.round(img.width * scale));
+          canvas.height = Math.max(1, Math.round(img.height * scale));
+          const ctx = canvas.getContext('2d');
+          if (!ctx) {
+            resolve(dataUrl);
+            return;
+          }
+          ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+          resolve(canvas.toDataURL('image/jpeg', 0.86));
+        };
+        img.src = dataUrl;
+      });
+
+      setInspirationImage(resizedDataUrl);
+      setInspirationImageLabel(file.name);
+    } catch {
+      notify('error', 'Impossible de charger cette image.');
+    } finally {
+      if (imageFileInputRef.current) imageFileInputRef.current.value = '';
+    }
+  };
+
+  const handleCreateFromImage = async () => {
+    if (!inspirationImage) {
+      notify('error', 'Veuillez importer ou choisir une image d’inspiration.');
+      return;
+    }
+    setAiWorking(true);
+    try {
+      const res = await apiFetch('/api/ai/ebook-from-image', {
+        method: 'POST',
+        body: JSON.stringify({
+          imageInput: inspirationImage,
+          userHint: inspirationHint.trim() || undefined,
+          authorName: formAuthor.trim() || bootstrap?.user?.profile.fullName || 'Auteur',
+          languageCode: formLang,
+          targetChapters: Math.min(12, Math.max(3, Number(formChaptersCount || 6))),
+          targetLength: formLength,
+          idempotencyKey: `from_img_${Date.now()}`,
+        }),
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        notify('error', data.error || 'Échec de la création depuis l’image.');
+        return;
+      }
+
+      const createdBook = data.book as Book;
+      const createdChapters = (data.chapters || []) as BookChapter[];
+
+      setBook(createdBook);
+      setActiveBookId(createdBook.id);
+      setChapters(createdChapters);
+      setFormTitle(createdBook.title);
+      setFormSubtitle(createdBook.subtitle);
+      setFormAuthor(createdBook.authorName);
+      setFormSubject(createdBook.subject);
+      setFormDescription(createdBook.description);
+      setFormLang(createdBook.languageCode);
+      setFormCategory(createdBook.categorySlug);
+      setFormAudience(createdBook.targetAudience);
+      setFormStyle(createdBook.writingStyle);
+      setFormChaptersCount(createdBook.targetChapters);
+      setFormLength(createdBook.targetLength);
+
+      setOutlineMeta({
+        introduction: data.introduction,
+        conclusion: data.conclusion,
+      });
+      setVisualAnalysisNote(data.visualAnalysis || null);
+
+      if (createdChapters.length > 0) {
+        setActiveChapterId(createdChapters[0].id);
+        setChapterTitleDraft(createdChapters[0].title);
+        setChapterHtmlDraft(createdChapters[0].contentHtml);
+      }
+
+      await Promise.all([loadMyBooksList(), refreshBootstrap()]);
+      setActiveTab('outline');
+      notify(
+        'success',
+        `eBook « ${createdBook.title} » généré à partir de votre image (${data.creditsCharged} crédits).`
+      );
+    } finally {
+      setAiWorking(false);
+    }
+  };
 
   const handleSaveProjectSetup = async (andGenerateOutline: boolean) => {
     if (!formTitle.trim()) {
@@ -654,7 +802,12 @@ export const StudioPage: React.FC<{ initialBookId?: string; initialTab?: StudioT
     try {
       const res = await apiFetch(`/api/books/${book.id}/export`, {
         method: 'POST',
-        body: JSON.stringify({ format }),
+        body: JSON.stringify({
+          format,
+          fontFamily: book.layoutConfig.fontFamily,
+          marginMm: book.layoutConfig.marginMm,
+          pdfStandard: format === 'pdf' ? exportPdfStandard : 'standard',
+        }),
       });
       if (!res.ok) {
         const err = await res.json().catch(() => ({}));
@@ -665,10 +818,18 @@ export const StudioPage: React.FC<{ initialBookId?: string; initialTab?: StudioT
       const url = URL.createObjectURL(blob);
       const a = document.createElement('a');
       a.href = url;
-      a.download = `${book.title.replace(/[^a-z0-9]+/gi, '-').toLowerCase() || 'ebook'}.${format}`;
+      const baseSlug = book.title.replace(/[^a-z0-9]+/gi, '-').toLowerCase() || 'ebook';
+      const pdfSuffix =
+        format === 'pdf' && exportPdfStandard !== 'standard'
+          ? `-${exportPdfStandard.toLowerCase().replace(/[^a-z0-9]+/g, '-')}`
+          : '';
+      a.download = `${baseSlug}${pdfSuffix}.${format}`;
       a.click();
       URL.revokeObjectURL(url);
-      notify('success', `Fichier ${format.toUpperCase()} généré et téléchargé.`);
+      notify(
+        'success',
+        `Fichier ${format === 'pdf' && exportPdfStandard !== 'standard' ? exportPdfStandard : format.toUpperCase()} généré et téléchargé.`
+      );
     } finally {
       setExportingFormat(null);
     }
@@ -751,12 +912,239 @@ export const StudioPage: React.FC<{ initialBookId?: string; initialTab?: StudioT
           {/* STEP 1: PROJECT SETUP */}
           {activeTab === 'setup' && (
             <div className="rounded-2xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 p-6 sm:p-8 max-w-4xl space-y-6">
-              <div>
-                <h2 className="font-display text-xl font-bold">Configuration du projet éditorial</h2>
-                <p className="mt-1 text-xs text-slate-500 dark:text-slate-400">
-                  La langue du livre est indépendante de la langue de l’interface.
-                </p>
+              <div className="flex flex-wrap items-start justify-between gap-4">
+                <div>
+                  <h2 className="font-display text-xl font-bold">
+                    {setupMode === 'image'
+                      ? 'Générateur d’eBook inspiré par une image'
+                      : 'Configuration du projet éditorial'}
+                  </h2>
+                  <p className="mt-1 text-xs text-slate-500 dark:text-slate-400">
+                    {setupMode === 'image'
+                      ? 'Importez une photo ou une illustration : Gemini Vision analyse son atmosphère et conçoit l’ouvrage, la couverture, le plan complet et l’ouverture du chapitre 1.'
+                      : 'La langue du livre est indépendante de la langue de l’interface.'}
+                  </p>
+                </div>
+
+                {/* Mode Switcher */}
+                <div className="inline-flex rounded-xl border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-950 p-1">
+                  <button
+                    type="button"
+                    onClick={() => setSetupMode('classic')}
+                    className={`inline-flex items-center gap-1.5 rounded-lg px-3 py-1.5 text-xs font-semibold transition-colors cursor-pointer ${
+                      setupMode === 'classic'
+                        ? 'bg-[#0F172A] text-white dark:bg-[#6D28D9]'
+                        : 'text-slate-600 dark:text-slate-300 hover:text-slate-900 dark:hover:text-white'
+                    }`}
+                  >
+                    <Sparkles className="h-3.5 w-3.5" />
+                    <span>Création classique</span>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setSetupMode('image')}
+                    className={`inline-flex items-center gap-1.5 rounded-lg px-3 py-1.5 text-xs font-semibold transition-colors cursor-pointer ${
+                      setupMode === 'image'
+                        ? 'bg-[#0F172A] text-white dark:bg-[#6D28D9]'
+                        : 'text-slate-600 dark:text-slate-300 hover:text-slate-900 dark:hover:text-white'
+                    }`}
+                  >
+                    <ImageIcon className="h-3.5 w-3.5" />
+                    <span>Inspiré par image</span>
+                  </button>
+                </div>
               </div>
+
+              {setupMode === 'image' ? (
+                <div className="space-y-6">
+                  {/* Image Upload + Preview */}
+                  <div className="grid grid-cols-1 md:grid-cols-12 gap-6 items-start">
+                    <div className="md:col-span-5">
+                      <label className="block text-xs font-semibold mb-2">
+                        1. Image d’inspiration *
+                      </label>
+                      <input
+                        ref={imageFileInputRef}
+                        type="file"
+                        accept="image/png,image/jpeg,image/webp"
+                        onChange={handleInspirationFileChange}
+                        className="hidden"
+                      />
+
+                      {inspirationImage ? (
+                        <div className="relative overflow-hidden rounded-xl border border-slate-200 dark:border-slate-700 bg-slate-100 dark:bg-slate-950">
+                          <img
+                            src={inspirationImage}
+                            alt="Aperçu d'inspiration"
+                            className="w-full aspect-[4/3] object-cover"
+                          />
+                          <button
+                            type="button"
+                            onClick={() => {
+                              setInspirationImage('');
+                              setInspirationImageLabel('');
+                            }}
+                            aria-label="Retirer l'image"
+                            className="absolute top-2 right-2 rounded-lg bg-slate-950/75 p-1.5 text-white hover:bg-slate-950 cursor-pointer"
+                          >
+                            <X className="h-4 w-4" />
+                          </button>
+                          <div className="px-3 py-2 text-[11px] font-medium text-slate-600 dark:text-slate-300 truncate border-t border-slate-200 dark:border-slate-800 bg-white/95 dark:bg-slate-900/95">
+                            {inspirationImageLabel || 'Image sélectionnée'}
+                          </div>
+                        </div>
+                      ) : (
+                        <button
+                          type="button"
+                          onClick={() => imageFileInputRef.current?.click()}
+                          className="w-full aspect-[4/3] rounded-xl border-2 border-dashed border-slate-300 dark:border-slate-700 bg-slate-50/60 dark:bg-slate-950/50 hover:border-[#6D28D9] dark:hover:border-violet-500 transition-colors flex flex-col items-center justify-center gap-2 p-6 text-center cursor-pointer"
+                        >
+                          <div className="rounded-xl bg-violet-100 dark:bg-violet-950/60 p-3 text-[#6D28D9] dark:text-violet-400">
+                            <Upload className="h-5 w-5" />
+                          </div>
+                          <div className="text-xs font-semibold text-slate-900 dark:text-slate-100">
+                            Importer une photo ou illustration
+                          </div>
+                          <div className="text-[11px] text-slate-500 dark:text-slate-400">
+                            PNG, JPEG ou WebP — Utilisée aussi comme base de couverture
+                          </div>
+                        </button>
+                      )}
+
+                      {inspirationImage && (
+                        <button
+                          type="button"
+                          onClick={() => imageFileInputRef.current?.click()}
+                          className="mt-2 w-full inline-flex items-center justify-center gap-1.5 rounded-lg border border-slate-200 dark:border-slate-700 px-3 py-1.5 text-xs font-medium hover:bg-slate-50 dark:hover:bg-slate-800 cursor-pointer"
+                        >
+                          <Upload className="h-3.5 w-3.5" />
+                          <span>Changer d’image</span>
+                        </button>
+                      )}
+                    </div>
+
+                    <div className="md:col-span-7 space-y-4">
+                      <div>
+                        <label className="block text-xs font-semibold mb-1.5">
+                          2. Orientation créative (optionnel)
+                        </label>
+                        <textarea
+                          rows={3}
+                          value={inspirationHint}
+                          onChange={(e) => setInspirationHint(e.target.value)}
+                          placeholder="Ex. Transformer cette ambiance en essai poétique sur l’architecture, ou en roman d’enquête atmosphérique, ou en guide pratique illustré…"
+                          className="w-full rounded-lg border border-slate-200 dark:border-slate-700 bg-transparent px-3 py-2 text-sm focus:border-[#6D28D9] focus:outline-none"
+                        />
+                      </div>
+
+                      <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                        <div>
+                          <label className="block text-xs font-medium mb-1">Auteur</label>
+                          <input
+                            type="text"
+                            value={formAuthor}
+                            onChange={(e) => setFormAuthor(e.target.value)}
+                            className="w-full rounded-lg border border-slate-200 dark:border-slate-700 bg-transparent px-3 py-2 text-sm"
+                          />
+                        </div>
+                        <div>
+                          <label className="block text-xs font-medium mb-1">Langue de l’eBook</label>
+                          <select
+                            value={formLang}
+                            onChange={(e) => setFormLang(e.target.value)}
+                            className="w-full rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900 px-3 py-2 text-sm"
+                          >
+                            {(bootstrap?.languages || []).map((l) => (
+                              <option key={l.code} value={l.code}>
+                                {l.nativeName} ({l.name})
+                              </option>
+                            ))}
+                          </select>
+                        </div>
+                        <div>
+                          <label className="block text-xs font-medium mb-1">Chapitres (3–12)</label>
+                          <input
+                            type="number"
+                            min={3}
+                            max={12}
+                            value={formChaptersCount}
+                            onChange={(e) => setFormChaptersCount(Number(e.target.value))}
+                            className="w-full rounded-lg border border-slate-200 dark:border-slate-700 bg-transparent px-3 py-2 text-sm tabular-nums"
+                          />
+                        </div>
+                        <div>
+                          <label className="block text-xs font-medium mb-1">Longueur</label>
+                          <select
+                            value={formLength}
+                            onChange={(e) => setFormLength(e.target.value)}
+                            className="w-full rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900 px-3 py-2 text-sm"
+                          >
+                            <option value="short">Court</option>
+                            <option value="medium">Moyen</option>
+                            <option value="long">Approfondi</option>
+                          </select>
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+
+                  {/* Quick-pick Studio Assets */}
+                  <div className="space-y-2 pt-2 border-t border-slate-100 dark:border-slate-800">
+                    <div className="text-xs font-semibold text-slate-600 dark:text-slate-300">
+                      Ou choisissez une image de la galerie Studio pour tester instantanément :
+                    </div>
+                    <div className="grid grid-cols-3 sm:grid-cols-6 gap-2.5">
+                      {[...STUDIO_ILLUSTRATION_ASSETS, ...STUDIO_COVER_ASSETS.slice(0, 2)].map((asset) => {
+                        const selected = inspirationImage === asset.url;
+                        return (
+                          <button
+                            key={asset.id}
+                            type="button"
+                            onClick={() => {
+                              setInspirationImage(asset.url);
+                              setInspirationImageLabel(asset.title);
+                            }}
+                            className={`group relative overflow-hidden rounded-lg border text-left transition-all cursor-pointer ${
+                              selected
+                                ? 'border-[#6D28D9] ring-2 ring-[#6D28D9]/40'
+                                : 'border-slate-200 dark:border-slate-800 hover:border-slate-400'
+                            }`}
+                          >
+                            <img
+                              src={asset.url}
+                              alt={asset.title}
+                              className="w-full aspect-[4/3] object-cover group-hover:scale-105 transition-transform"
+                            />
+                            <div className="px-1.5 py-1 text-[10px] font-medium truncate bg-white dark:bg-slate-900">
+                              {asset.title}
+                            </div>
+                          </button>
+                        );
+                      })}
+                    </div>
+                  </div>
+
+                  <div className="flex flex-wrap items-center justify-between gap-3 pt-2">
+                    <div className="text-xs text-slate-500 dark:text-slate-400">
+                      Génère automatiquement : titre, synopsis, palette harmonisée, plan structuré et chapitre 1 rédigé.
+                    </div>
+                    <button
+                      type="button"
+                      disabled={aiWorking || !inspirationImage}
+                      onClick={handleCreateFromImage}
+                      className="inline-flex items-center gap-2 rounded-lg bg-[#6D28D9] px-5 py-2.5 text-sm font-semibold text-white hover:bg-violet-700 cursor-pointer disabled:opacity-50"
+                    >
+                      <Wand2 className="h-4 w-4" />
+                      <span>
+                        {aiWorking
+                          ? 'Analyse visuelle & création en cours…'
+                          : `Analyser l’image & Générer l’eBook (${bootstrap?.aiCosts?.from_image ?? 10} crédits)`}
+                      </span>
+                    </button>
+                  </div>
+                </div>
+              ) : (
+                <>
 
               <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
                 <div className="sm:col-span-2">
@@ -915,6 +1303,8 @@ export const StudioPage: React.FC<{ initialBookId?: string; initialTab?: StudioT
                   <span>{book ? 'Mettre à jour' : 'Créer sans plan IA'}</span>
                 </button>
               </div>
+                </>
+              )}
             </div>
           )}
 
@@ -942,6 +1332,24 @@ export const StudioPage: React.FC<{ initialBookId?: string; initialTab?: StudioT
                   </span>
                 </button>
               </div>
+
+              {visualAnalysisNote && (
+                <div className="rounded-xl border border-violet-200 dark:border-violet-900/60 bg-violet-50/70 dark:bg-violet-950/30 p-4 text-xs flex flex-col sm:flex-row sm:items-center gap-4">
+                  {book.coverImageUrl && (
+                    <img
+                      src={book.coverImageUrl}
+                      alt="Image d'inspiration"
+                      className="h-16 w-20 rounded-lg object-cover shrink-0 border border-violet-200 dark:border-violet-800"
+                    />
+                  )}
+                  <div>
+                    <div className="font-semibold text-[#6D28D9] dark:text-violet-300">
+                      Analyse visuelle Gemini de votre image d’inspiration
+                    </div>
+                    <p className="mt-1 text-slate-700 dark:text-slate-300">{visualAnalysisNote}</p>
+                  </div>
+                </div>
+              )}
 
               {outlineMeta && (
                 <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
@@ -1929,14 +2337,14 @@ export const StudioPage: React.FC<{ initialBookId?: string; initialTab?: StudioT
 
                 <div>
                   <label className="block text-xs font-medium mb-1">Police du corps</label>
-                  <select
+                      <select
                     value={book.layoutConfig.fontFamily}
                     onChange={(e) =>
                       setBook({
                         ...book,
                         layoutConfig: {
                           ...book.layoutConfig,
-                          fontFamily: e.target.value as 'serif' | 'sans',
+                          fontFamily: e.target.value as LayoutConfig['fontFamily'],
                         },
                       })
                     }
@@ -1944,6 +2352,7 @@ export const StudioPage: React.FC<{ initialBookId?: string; initialTab?: StudioT
                   >
                     <option value="serif">Sérif Classique (Roman/Essai)</option>
                     <option value="sans">Sans-Sérif Moderne (Technique)</option>
+                    <option value="mono">Monospace (Courier / Code)</option>
                   </select>
                 </div>
 
@@ -2107,10 +2516,35 @@ export const StudioPage: React.FC<{ initialBookId?: string; initialTab?: StudioT
                   Les exports conservent la couverture, la table des matières, vos chapitres, les illustrations et vos réglages de mise en page.
                 </p>
 
+                <div className="rounded-xl border border-slate-200 dark:border-slate-800 bg-slate-50/70 dark:bg-slate-950/50 p-3.5 flex flex-wrap items-center justify-between gap-3">
+                  <div className="flex items-center gap-2 text-xs font-semibold">
+                    <ShieldCheck className="h-4 w-4 text-[#6D28D9] dark:text-violet-400 shrink-0" />
+                    <span>Norme d’archivage PDF/A (ISO 19005)</span>
+                  </div>
+                  <select
+                    value={exportPdfStandard}
+                    onChange={(e) => setExportPdfStandard(e.target.value as PdfStandard)}
+                    aria-label="Norme PDF/A"
+                    className="rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900 px-3 py-1.5 text-xs font-medium"
+                  >
+                    <option value="standard">PDF Standard</option>
+                    <option value="PDF/A-1b">PDF/A-1b (ISO 19005-1)</option>
+                    <option value="PDF/A-2b">PDF/A-2b (ISO 19005-2)</option>
+                    <option value="PDF/A-3b">PDF/A-3b (ISO 19005-3)</option>
+                  </select>
+                </div>
+
                 <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
                   {(
                     [
-                      { id: 'pdf', label: 'PDF Haute Qualité', desc: 'Format A4/A5/Letter paginé pour impression et lecture' },
+                      {
+                        id: 'pdf',
+                        label: exportPdfStandard === 'standard' ? 'PDF Haute Qualité' : `${exportPdfStandard} Archival`,
+                        desc:
+                          exportPdfStandard === 'standard'
+                            ? 'Format A4/A5/Letter paginé pour impression et lecture'
+                            : 'Archivage longue durée ISO 19005 avec polices incorporées et profil sRGB',
+                      },
                       { id: 'epub', label: 'EPUB 3 Standard', desc: 'Compatible Kindle, Kobo, Apple Books (inclut RTL)' },
                       { id: 'html', label: 'HTML5 Autonome', desc: 'Page web sémantique publiable directement' },
                       { id: 'docx', label: 'Microsoft Word (.docx)', desc: 'Manuscrit éditable pour révision externe' },
@@ -2140,7 +2574,9 @@ export const StudioPage: React.FC<{ initialBookId?: string; initialTab?: StudioT
                               ? 'Offre Pro requise'
                               : exportingFormat === fmt.id
                                 ? 'Génération…'
-                                : `Télécharger ${fmt.id.toUpperCase()}`}
+                                : fmt.id === 'pdf' && exportPdfStandard !== 'standard'
+                                  ? `Télécharger ${exportPdfStandard}`
+                                  : `Télécharger ${fmt.id.toUpperCase()}`}
                           </span>
                         </button>
                       </div>
@@ -2191,6 +2627,35 @@ export const StudioPage: React.FC<{ initialBookId?: string; initialTab?: StudioT
           )}
         </div>
       )}
+
+      <AiWriterAssistantPanel
+        bookId={book?.id}
+        activeChapterId={activeChapter?.id}
+        draftContext={{
+          title: book?.title || formTitle,
+          subtitle: book?.subtitle || formSubtitle,
+          subject: book?.subject || formSubject,
+          description: book?.description || formDescription,
+          languageCode: book?.languageCode || formLang,
+          categorySlug: book?.categorySlug || formCategory,
+          targetAudience: book?.targetAudience || formAudience,
+          writingStyle: book?.writingStyle || formStyle,
+          activeChapterTitle: activeChapter ? chapterTitleDraft || activeChapter.title : undefined,
+          activeChapterExcerpt: activeChapter
+            ? chapterHtmlDraft.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim() ||
+              activeChapter.summary
+            : undefined,
+        }}
+        canInsertToChapter={Boolean(book && activeChapter)}
+        onInsertToChapter={(html) => {
+          if (!activeChapter) return;
+          const nextHtml = `${chapterHtmlDraft || ''}\n${html}`;
+          setChapterHtmlDraft(nextHtml);
+          if (editorRef.current) editorRef.current.innerHTML = nextHtml;
+          setActiveTab('editor');
+          notify('success', 'Suggestion insérée dans le chapitre actif.');
+        }}
+      />
     </DashboardShell>
   );
 };

@@ -138,7 +138,11 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       const headers = new Headers(init.headers);
       let activeToken = idToken;
       if (auth.currentUser && !activeToken) {
-        activeToken = await auth.currentUser.getIdToken();
+        try {
+          activeToken = await auth.currentUser.getIdToken();
+        } catch {
+          activeToken = null;
+        }
       }
       if (activeToken) {
         headers.set('Authorization', `Bearer ${activeToken}`);
@@ -146,7 +150,50 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       if (!headers.has('Content-Type') && init.body && !(init.body instanceof FormData)) {
         headers.set('Content-Type', 'application/json');
       }
-      return await fetch(path, { ...init, headers });
+
+      const method = (init.method || 'GET').toUpperCase();
+      const canRetry = method === 'GET' || method === 'HEAD';
+      const maxAttempts = canRetry ? 2 : 1;
+
+      for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+        try {
+          const response = await fetch(path, { ...init, headers });
+          if (canRetry && attempt < maxAttempts && response.status >= 502) {
+            await new Promise((r) => setTimeout(r, 350));
+            continue;
+          }
+          return response;
+        } catch (err) {
+          if (init.signal?.aborted || (err instanceof DOMException && err.name === 'AbortError')) {
+            throw err;
+          }
+          if (attempt < maxAttempts) {
+            await new Promise((r) => setTimeout(r, 350));
+            continue;
+          }
+          return new Response(
+            JSON.stringify({
+              error: 'Connexion au serveur momentanément interrompue. Veuillez réessayer.',
+            }),
+            {
+              status: 503,
+              statusText: 'Service Unavailable',
+              headers: { 'Content-Type': 'application/json' },
+            }
+          );
+        }
+      }
+
+      return new Response(
+        JSON.stringify({
+          error: 'Connexion au serveur momentanément interrompue. Veuillez réessayer.',
+        }),
+        {
+          status: 503,
+          statusText: 'Service Unavailable',
+          headers: { 'Content-Type': 'application/json' },
+        }
+      );
     },
     [idToken]
   );
@@ -154,7 +201,11 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
   const refreshBootstrap = useCallback(async () => {
     setLoadingBootstrap(true);
     try {
-      const res = await apiFetch('/api/bootstrap');
+      let res = await apiFetch('/api/bootstrap');
+      if (!res.ok && res.status >= 500) {
+        await new Promise((r) => setTimeout(r, 600));
+        res = await apiFetch('/api/bootstrap');
+      }
       if (res.ok) {
         const data = (await res.json()) as BootstrapData;
         setBootstrap(data);

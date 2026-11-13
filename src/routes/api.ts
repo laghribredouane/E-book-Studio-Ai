@@ -27,15 +27,18 @@ import {
   type LayoutConfig,
 } from '../db/schema.ts';
 import { ensureSeeded } from '../db/seed.ts';
-import { AuthRequest, optionalAuth, requireAdmin, requireAuth } from '../middleware/auth.ts';
+import { type AuthRequest, optionalAuth, requireAdmin, requireAuth } from '../middleware/auth.ts';
 import { chargeCreditsAtomic, getAiCosts, getCreditBalance, refundCreditsAtomic } from '../services/credits.ts';
 import {
   generateBookIllustration,
   generateBookOutline,
   generateChapterDraft,
+  generateEbookFromImage,
   getConfiguredModels,
   proofreadManuscript,
   runAiTextTool,
+  streamWriterAssistantChat,
+  type WriterChatMessage,
 } from '../services/ai-gemini.ts';
 import {
   generateDocxBuffer,
@@ -1393,6 +1396,384 @@ apiRouter.post('/ai/image', requireAuth, async (req: AuthRequest, res) => {
   }
 });
 
+apiRouter.post('/ai/ebook-from-image', requireAuth, async (req: AuthRequest, res) => {
+  const profile = req.profile!;
+  if (!checkAiRateLimit(profile.id)) {
+    return res.status(429).json({ error: 'Trop de requêtes IA. Veuillez patienter quelques secondes.' });
+  }
+
+  const planDef = PLAN_CATALOG[(profile.plan as PlanId) || 'free'] || PLAN_CATALOG.free;
+  const existingCountRows = await db
+    .select({ total: count() })
+    .from(books)
+    .where(eq(books.authorProfileId, profile.id));
+  const currentCount = Number(existingCountRows[0]?.total ?? 0);
+
+  if (currentCount >= planDef.maxProjects && profile.role !== 'admin') {
+    return res.status(403).json({
+      error: `Limite atteinte (${planDef.maxProjects} projets maximum pour l’offre ${planDef.name}). Passez à une offre supérieure ou supprimez un brouillon.`,
+    });
+  }
+
+  const {
+    imageInput,
+    userHint,
+    authorName,
+    languageCode,
+    targetChapters,
+    targetLength,
+    idempotencyKey,
+  } = req.body || {};
+
+  const imageStr = String(imageInput || '').trim();
+  if (!imageStr) {
+    return res.status(400).json({ error: 'Veuillez sélectionner ou importer une image d’inspiration.' });
+  }
+  if (imageStr.length > 8_000_000) {
+    return res.status(400).json({ error: 'Image trop volumineuse (max ~6 Mo).' });
+  }
+  if (!imageStr.startsWith('data:image/') && !imageStr.startsWith('/src/assets/images/')) {
+    return res.status(400).json({ error: 'Format ou source d’image non autorisé.' });
+  }
+
+  const safeLang = String(languageCode || 'fr').trim() || 'fr';
+  const safeChapters = Math.min(12, Math.max(3, Number(targetChapters || 6)));
+  const safeLength = ['short', 'medium', 'long'].includes(String(targetLength))
+    ? String(targetLength)
+    : 'medium';
+
+  let chargedAmount = 0;
+  try {
+    const categoriesRows = await db.select().from(bookCategories).orderBy(bookCategories.sortOrder);
+    const categorySlugs = categoriesRows.map((c) => c.slug);
+
+    const charge = await chargeCreditsAtomic({
+      profileId: profile.id,
+      action: 'from_image',
+      description: 'Création d’eBook inspiré par une image',
+      idempotencyKey,
+    });
+    if (charge.duplicate) {
+      return res.status(409).json({ error: 'Requête déjà traitée.' });
+    }
+    chargedAmount = charge.charged;
+
+    const generated = await generateEbookFromImage({
+      imageInput: imageStr,
+      userHint: userHint ? String(userHint).trim().slice(0, 600) : undefined,
+      languageCode: safeLang,
+      targetChapters: safeChapters,
+      targetLength: safeLength,
+      availableCategories: categorySlugs,
+    });
+
+    const validCat = categorySlugs.includes(generated.categorySlug)
+      ? generated.categorySlug
+      : categorySlugs[0] || 'literature';
+
+    const sanitizeHex = (v: string, fallback: string) =>
+      /^#[0-9A-Fa-f]{6}$/.test(v?.trim() || '') ? v.trim() : fallback;
+
+    const coverConfig: CoverConfig = {
+      ...DEFAULT_COVER,
+      backgroundColor: sanitizeHex(generated.backgroundColor, DEFAULT_COVER.backgroundColor),
+      accentColor: sanitizeHex(generated.accentColor, DEFAULT_COVER.accentColor),
+      textColor: sanitizeHex(generated.textColor, DEFAULT_COVER.textColor),
+      badgeText: (generated.badgeText || 'Édition Inspirée').slice(0, 40),
+    };
+
+    const [createdBook] = await db
+      .insert(books)
+      .values({
+        authorProfileId: profile.id,
+        title: (generated.title || 'eBook inspiré par image').slice(0, 200),
+        subtitle: (generated.subtitle || '').slice(0, 260),
+        authorName: String(authorName || profile.fullName || 'Auteur').trim(),
+        subject: generated.subject || '',
+        description: generated.description || '',
+        languageCode: safeLang,
+        categorySlug: validCat,
+        targetAudience: generated.targetAudience || 'Lecteurs curieux',
+        writingStyle: generated.writingStyle || 'Éditorial immersif',
+        targetChapters: generated.chapters.length || safeChapters,
+        targetLength: safeLength,
+        status: 'in_progress',
+        isPublic: false,
+        coverImageUrl: imageStr,
+        coverConfig,
+        layoutConfig: DEFAULT_LAYOUT,
+      })
+      .returning();
+
+    const insertedChapters = [];
+    let totalWords = 0;
+    const chOneCleanHtml = (generated.chapterOneHtml || '')
+      .replace(/^```html\s*/i, '')
+      .replace(/```$/i, '')
+      .trim();
+
+    for (let i = 0; i < generated.chapters.length; i++) {
+      const ch = generated.chapters[i];
+      const summaryText = `${ch.summary}\n${(ch.sections || []).map((s) => `• ${s}`).join('\n')}`.trim();
+      const html = i === 0 && chOneCleanHtml ? chOneCleanHtml : '';
+      const wc = html ? countWordsInHtml(html) : 0;
+      totalWords += wc;
+
+      const [savedCh] = await db
+        .insert(bookChapters)
+        .values({
+          bookId: createdBook.id,
+          chapterNumber: i + 1,
+          title: ch.title,
+          summary: summaryText,
+          contentHtml: html,
+          wordCount: wc,
+          status: html ? 'draft' : 'outline',
+          sortOrder: i + 1,
+        })
+        .returning();
+      insertedChapters.push(savedCh);
+    }
+
+    const [finalBook] = await db
+      .update(books)
+      .set({ wordCount: totalWords, updatedAt: new Date() })
+      .where(eq(books.id, createdBook.id))
+      .returning();
+
+    await db.insert(bookImages).values({
+      bookId: createdBook.id,
+      chapterId: insertedChapters[0]?.id || null,
+      profileId: profile.id,
+      prompt: `Image source d’inspiration : ${generated.visualAnalysis}`.slice(0, 500),
+      style: 'inspiration',
+      kind: 'cover',
+      imageUrl: imageStr,
+    });
+
+    await db.insert(aiGenerations).values({
+      profileId: profile.id,
+      bookId: createdBook.id,
+      model: generated.model,
+      action: 'from_image',
+      promptSummary: (userHint || generated.title).slice(0, 120),
+      creditsCharged: chargedAmount,
+      status: 'completed',
+    });
+
+    await logAudit(profile.id, 'book_created_from_image', 'book', createdBook.id, {
+      title: createdBook.title,
+    });
+
+    res.status(201).json({
+      book: finalBook,
+      chapters: insertedChapters,
+      visualAnalysis: generated.visualAnalysis,
+      introduction: generated.introduction,
+      conclusion: generated.conclusion,
+      newBalance: charge.newBalance,
+      creditsCharged: chargedAmount,
+    });
+  } catch (error: unknown) {
+    const errMsg = error instanceof Error ? error.message : 'Erreur Gemini';
+    if (errMsg === 'INSUFFICIENT_CREDITS') {
+      return res.status(402).json({ error: 'Crédits IA insuffisants pour générer depuis une image.' });
+    }
+    await refundCreditsAtomic({
+      profileId: profile.id,
+      amount: chargedAmount,
+      action: 'from_image',
+      description: 'Remboursement suite à une erreur de génération par image',
+    });
+    console.error('AI ebook-from-image failed:', error);
+    res.status(500).json({ error: `Échec de l’analyse visuelle : ${errMsg}` });
+  }
+});
+
+apiRouter.post('/ai/writer-chat', requireAuth, async (req: AuthRequest, res) => {
+  const profile = req.profile!;
+  if (!checkAiRateLimit(profile.id)) {
+    return res.status(429).json({ error: 'Trop de requêtes IA. Veuillez patienter quelques secondes.' });
+  }
+
+  const {
+    bookId,
+    activeChapterId,
+    message,
+    history,
+    draftContext,
+    idempotencyKey,
+  } = req.body || {};
+
+  const trimmedMessage = String(message || '').trim();
+  if (!trimmedMessage) {
+    return res.status(400).json({ error: 'Veuillez saisir un message.' });
+  }
+  if (trimmedMessage.length > 6000) {
+    return res.status(400).json({ error: 'Message trop long (max 6000 caractères).' });
+  }
+
+  let bookContext: {
+    title?: string;
+    subtitle?: string;
+    subject?: string;
+    description?: string;
+    languageCode?: string;
+    categorySlug?: string;
+    targetAudience?: string;
+    writingStyle?: string;
+    chaptersOutline?: Array<{ chapterNumber: number; title: string }>;
+    activeChapterTitle?: string;
+    activeChapterExcerpt?: string;
+  } = {
+    title: draftContext?.title ? String(draftContext.title) : undefined,
+    subtitle: draftContext?.subtitle ? String(draftContext.subtitle) : undefined,
+    subject: draftContext?.subject ? String(draftContext.subject) : undefined,
+    description: draftContext?.description ? String(draftContext.description) : undefined,
+    languageCode: draftContext?.languageCode ? String(draftContext.languageCode) : 'fr',
+    categorySlug: draftContext?.categorySlug ? String(draftContext.categorySlug) : undefined,
+    targetAudience: draftContext?.targetAudience ? String(draftContext.targetAudience) : undefined,
+    writingStyle: draftContext?.writingStyle ? String(draftContext.writingStyle) : undefined,
+    activeChapterTitle: draftContext?.activeChapterTitle ? String(draftContext.activeChapterTitle) : undefined,
+    activeChapterExcerpt: draftContext?.activeChapterExcerpt
+      ? String(draftContext.activeChapterExcerpt)
+      : undefined,
+  };
+
+  let verifiedBookId: string | null = null;
+  if (bookId) {
+    const bookRows = await db.select().from(books).where(eq(books.id, String(bookId))).limit(1);
+    if (bookRows.length === 0) {
+      return res.status(404).json({ error: 'Livre introuvable.' });
+    }
+    const book = bookRows[0];
+    if (book.authorProfileId !== profile.id && profile.role !== 'admin') {
+      return res.status(403).json({ error: 'Accès refusé.' });
+    }
+    verifiedBookId = book.id;
+
+    const chapters = await db
+      .select()
+      .from(bookChapters)
+      .where(eq(bookChapters.bookId, book.id))
+      .orderBy(bookChapters.sortOrder, bookChapters.chapterNumber);
+
+    const activeCh = activeChapterId
+      ? chapters.find((c) => c.id === String(activeChapterId))
+      : chapters[0];
+
+    const chapterPlain = activeCh
+      ? activeCh.contentHtml.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim()
+      : '';
+
+    bookContext = {
+      title: book.title,
+      subtitle: book.subtitle,
+      subject: book.subject,
+      description: book.description,
+      languageCode: book.languageCode,
+      categorySlug: book.categorySlug,
+      targetAudience: book.targetAudience,
+      writingStyle: book.writingStyle,
+      chaptersOutline: chapters.map((c) => ({ chapterNumber: c.chapterNumber, title: c.title })),
+      activeChapterTitle: draftContext?.activeChapterTitle || activeCh?.title,
+      activeChapterExcerpt: draftContext?.activeChapterExcerpt || chapterPlain || activeCh?.summary,
+    };
+  }
+
+  let chargedAmount = 0;
+  let newBalance = 0;
+  try {
+    const charge = await chargeCreditsAtomic({
+      profileId: profile.id,
+      action: 'writer_chat',
+      description: `AI Writer Assistant : ${bookContext.title || 'Projet en cours'}`,
+      idempotencyKey,
+    });
+    if (charge.duplicate) {
+      return res.status(409).json({ error: 'Requête déjà traitée.' });
+    }
+    chargedAmount = charge.charged;
+    newBalance = charge.newBalance;
+  } catch (error: unknown) {
+    const errMsg = error instanceof Error ? error.message : 'Erreur crédits';
+    if (errMsg === 'INSUFFICIENT_CREDITS') {
+      return res.status(402).json({ error: 'Crédits IA insuffisants pour l’assistant.' });
+    }
+    return res.status(500).json({ error: errMsg });
+  }
+
+  res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
+  res.setHeader('Cache-Control', 'no-cache, no-transform');
+  res.setHeader('Connection', 'keep-alive');
+  res.flushHeaders?.();
+
+  const sendEvent = (payload: Record<string, unknown>) => {
+    res.write(`data: ${JSON.stringify(payload)}\n\n`);
+  };
+
+  sendEvent({ type: 'meta', newBalance, creditsCharged: chargedAmount });
+
+  let producedAnyChunk = false;
+  try {
+    const safeHistory: WriterChatMessage[] = Array.isArray(history)
+      ? history
+          .filter(
+            (m: unknown): m is WriterChatMessage =>
+              Boolean(m) &&
+              typeof m === 'object' &&
+              ((m as WriterChatMessage).role === 'user' ||
+                (m as WriterChatMessage).role === 'assistant') &&
+              typeof (m as WriterChatMessage).content === 'string'
+          )
+          .slice(-16)
+      : [];
+
+    const generator = streamWriterAssistantChat({
+      message: trimmedMessage,
+      history: safeHistory,
+      bookContext,
+    });
+
+    while (true) {
+      const next = await generator.next();
+      if (next.done) {
+        const models = await getConfiguredModels();
+        await db.insert(aiGenerations).values({
+          profileId: profile.id,
+          bookId: verifiedBookId,
+          model: next.value?.model || models.textModel,
+          action: 'writer_chat',
+          promptSummary: trimmedMessage.slice(0, 120),
+          creditsCharged: chargedAmount,
+          status: 'completed',
+        });
+        break;
+      }
+      if (next.value) {
+        producedAnyChunk = true;
+        sendEvent({ type: 'delta', text: next.value });
+      }
+    }
+
+    sendEvent({ type: 'done' });
+    res.end();
+  } catch (error: unknown) {
+    const errMsg = error instanceof Error ? error.message : 'Erreur Gemini';
+    if (!producedAnyChunk && chargedAmount > 0) {
+      await refundCreditsAtomic({
+        profileId: profile.id,
+        amount: chargedAmount,
+        action: 'writer_chat',
+        description: 'Remboursement suite à une erreur AI Writer Assistant',
+      });
+    }
+    console.error('AI writer-chat failed:', error);
+    sendEvent({ type: 'error', error: `Erreur Gemini : ${errMsg}` });
+    res.end();
+  }
+});
+
 apiRouter.get('/my/images', requireAuth, async (req: AuthRequest, res) => {
   try {
     const images = await db
@@ -1440,6 +1821,24 @@ apiRouter.post('/books/:id/export', requireAuth, async (req: AuthRequest, res) =
       .where(eq(bookChapters.bookId, book.id))
       .orderBy(bookChapters.sortOrder, bookChapters.chapterNumber);
 
+    const requestedFont = req.body?.fontFamily;
+    const requestedMargin = req.body?.marginMm;
+    const requestedPdfStandard = req.body?.pdfStandard;
+    const customFontFamily =
+      requestedFont === 'serif' || requestedFont === 'sans' || requestedFont === 'mono'
+        ? requestedFont
+        : book.layoutConfig.fontFamily;
+    const customMarginMm =
+      requestedMargin !== undefined && Number.isFinite(Number(requestedMargin))
+        ? Math.min(40, Math.max(10, Math.round(Number(requestedMargin))))
+        : book.layoutConfig.marginMm;
+    const pdfStandard =
+      requestedPdfStandard === 'PDF/A-1b' ||
+      requestedPdfStandard === 'PDF/A-2b' ||
+      requestedPdfStandard === 'PDF/A-3b'
+        ? requestedPdfStandard
+        : 'standard';
+
     const payload = {
       id: book.id,
       title: book.title,
@@ -1449,7 +1848,12 @@ apiRouter.post('/books/:id/export', requireAuth, async (req: AuthRequest, res) =
       languageCode: book.languageCode,
       coverImageUrl: book.coverImageUrl,
       coverConfig: book.coverConfig,
-      layoutConfig: book.layoutConfig,
+      layoutConfig: {
+        ...book.layoutConfig,
+        fontFamily: customFontFamily,
+        marginMm: customMarginMm,
+      },
+      pdfStandard,
       chapters: chapters.map((c) => ({
         chapterNumber: c.chapterNumber,
         title: c.title,
@@ -1462,7 +1866,11 @@ apiRouter.post('/books/:id/export', requireAuth, async (req: AuthRequest, res) =
       .toLowerCase()
       .replace(/[^a-z0-9]+/gi, '-')
       .replace(/^-|-$/g, '') || 'ebook';
-    const fileName = `${slug}.${format}`;
+    const pdfSuffix =
+      format === 'pdf' && pdfStandard !== 'standard'
+        ? `-${pdfStandard.toLowerCase().replace(/[^a-z0-9]+/g, '-')}`
+        : '';
+    const fileName = `${slug}${pdfSuffix}.${format}`;
 
     let buffer: Buffer;
     let contentType: string;

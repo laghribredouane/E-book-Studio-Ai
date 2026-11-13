@@ -8,14 +8,17 @@ import {
   MailCheck,
   Moon,
   Plus,
+  ShieldCheck,
+  SlidersHorizontal,
   Sun,
+  Type,
 } from 'lucide-react';
 import { useApp } from '../contexts/AppContext';
 import { DashboardShell } from '../components/DashboardShell';
 import { SUPPORTED_LOCALES } from '../i18n/translations';
 import { resendVerificationEmail } from '../lib/firebase';
 import { STUDIO_COVER_ASSETS, STUDIO_ILLUSTRATION_ASSETS } from '../lib/studioAssets';
-import type { Book, BookImage, BookTemplate } from '../types';
+import type { Book, BookImage, BookTemplate, PdfStandard } from '../types';
 
 export const IllustrationsGalleryPage: React.FC = () => {
   const { apiFetch, navigate, notify } = useApp();
@@ -259,14 +262,31 @@ export const ExportCenterPage: React.FC = () => {
     }>
   >([]);
   const [selectedBookId, setSelectedBookId] = useState('');
+  const [pdfFontFamily, setPdfFontFamily] = useState<'serif' | 'sans' | 'mono'>('serif');
+  const [pdfMarginMm, setPdfMarginMm] = useState<number>(20);
+  const [pdfStandard, setPdfStandard] = useState<PdfStandard>('standard');
   const [busyFormat, setBusyFormat] = useState<string | null>(null);
+
+  const selectedBook = books.find((b) => b.id === selectedBookId) || null;
+
+  const syncLayoutDefaults = (targetBook?: Book | null) => {
+    if (!targetBook) return;
+    const f = targetBook.layoutConfig?.fontFamily;
+    setPdfFontFamily(f === 'sans' || f === 'mono' ? f : 'serif');
+    const m = Number(targetBook.layoutConfig?.marginMm);
+    setPdfMarginMm(Number.isFinite(m) ? Math.min(40, Math.max(10, Math.round(m))) : 20);
+  };
 
   const loadAll = async () => {
     const [bRes, eRes] = await Promise.all([apiFetch('/api/my/books'), apiFetch('/api/my/exports')]);
     if (bRes.ok) {
       const bd = await bRes.json();
-      setBooks(bd.books || []);
-      if (bd.books?.[0] && !selectedBookId) setSelectedBookId(bd.books[0].id);
+      const loadedBooks = (bd.books || []) as Book[];
+      setBooks(loadedBooks);
+      if (loadedBooks[0] && !selectedBookId) {
+        setSelectedBookId(loadedBooks[0].id);
+        syncLayoutDefaults(loadedBooks[0]);
+      }
     }
     if (eRes.ok) {
       const ed = await eRes.json();
@@ -279,13 +299,24 @@ export const ExportCenterPage: React.FC = () => {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
+  const handleSelectBook = (bookId: string) => {
+    setSelectedBookId(bookId);
+    const match = books.find((b) => b.id === bookId);
+    syncLayoutDefaults(match);
+  };
+
   const triggerExport = async (format: 'pdf' | 'epub' | 'html' | 'docx') => {
     if (!selectedBookId) return;
     setBusyFormat(format);
     try {
       const res = await apiFetch(`/api/books/${selectedBookId}/export`, {
         method: 'POST',
-        body: JSON.stringify({ format }),
+        body: JSON.stringify({
+          format,
+          fontFamily: pdfFontFamily,
+          marginMm: pdfMarginMm,
+          pdfStandard: format === 'pdf' ? pdfStandard : 'standard',
+        }),
       });
       if (!res.ok) {
         const err = await res.json().catch(() => ({}));
@@ -296,25 +327,80 @@ export const ExportCenterPage: React.FC = () => {
       const url = URL.createObjectURL(blob);
       const a = document.createElement('a');
       a.href = url;
-      a.download = `ebook-export.${format}`;
+      const slug =
+        selectedBook?.title
+          .toLowerCase()
+          .replace(/[^a-z0-9]+/gi, '-')
+          .replace(/^-|-$/g, '') || 'ebook-export';
+      const pdfSuffix =
+        format === 'pdf' && pdfStandard !== 'standard'
+          ? `-${pdfStandard.toLowerCase().replace(/[^a-z0-9]+/g, '-')}`
+          : '';
+      a.download = `${slug}${pdfSuffix}.${format}`;
       a.click();
       URL.revokeObjectURL(url);
-      notify('success', `Export ${format.toUpperCase()} terminé.`);
+      notify(
+        'success',
+        `Export ${format === 'pdf' && pdfStandard !== 'standard' ? pdfStandard : format.toUpperCase()} terminé.`
+      );
       void loadAll();
     } finally {
       setBusyFormat(null);
     }
   };
 
+  const fontOptions: Array<{
+    id: 'serif' | 'sans' | 'mono';
+    label: string;
+    desc: string;
+    previewClass: string;
+  }> = [
+    {
+      id: 'serif',
+      label: 'Serif',
+      desc: 'Classique littéraire (Times)',
+      previewClass: 'font-serif',
+    },
+    {
+      id: 'sans',
+      label: 'Sans',
+      desc: 'Moderne & épurée (Helvetica)',
+      previewClass: 'font-sans',
+    },
+    {
+      id: 'mono',
+      label: 'Mono',
+      desc: 'Chasse fixe technique (Courier)',
+      previewClass: 'font-mono',
+    },
+  ];
+
+  const marginPresets = [
+    { label: 'Étroites', mm: 12 },
+    { label: 'Standard', mm: 20 },
+    { label: 'Confort', mm: 26 },
+    { label: 'Larges', mm: 34 },
+  ];
+
+  const previewPaddingPx = Math.round(8 + ((pdfMarginMm - 10) / 30) * 20);
+  const previewFontClass =
+    pdfFontFamily === 'sans' ? 'font-sans' : pdfFontFamily === 'mono' ? 'font-mono' : 'font-serif';
+
   return (
     <DashboardShell title="Centre d’exportation" breadcrumb="EBOOK STUDIO AI / Export Center">
       <div className="space-y-8">
-        <div className="rounded-2xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 p-6 space-y-4">
-          <h2 className="font-display text-lg font-bold">Générer un nouveau fichier</h2>
-          <div className="flex flex-wrap items-center gap-3">
+        <div className="rounded-2xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 p-6 space-y-6">
+          <div className="flex flex-wrap items-center justify-between gap-4">
+            <div>
+              <h2 className="font-display text-lg font-bold">Générer un nouveau fichier</h2>
+              <p className="text-xs text-slate-500 dark:text-slate-400">
+                Sélectionnez un ouvrage, personnalisez la typographie et les marges, puis générez votre fichier.
+              </p>
+            </div>
             <select
               value={selectedBookId}
-              onChange={(e) => setSelectedBookId(e.target.value)}
+              onChange={(e) => handleSelectBook(e.target.value)}
+              aria-label="Livre à exporter"
               className="min-w-[260px] rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900 px-3 py-2 text-sm"
             >
               {books.length === 0 ? (
@@ -327,17 +413,203 @@ export const ExportCenterPage: React.FC = () => {
                 ))
               )}
             </select>
+          </div>
 
+          {/* PDF Font & Margin Customization */}
+          <div className="grid grid-cols-1 lg:grid-cols-12 gap-6 rounded-xl border border-slate-200 dark:border-slate-800 bg-slate-50/70 dark:bg-slate-950/50 p-5">
+            <div className="lg:col-span-8 space-y-5">
+              <div className="space-y-2.5">
+                <div className="flex items-center gap-1.5 text-xs font-semibold text-slate-800 dark:text-slate-200">
+                  <Type className="h-3.5 w-3.5 text-[#6D28D9] dark:text-violet-400" />
+                  <span>Police de caractères (PDF & rendu texte)</span>
+                </div>
+                <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+                  {fontOptions.map((opt) => {
+                    const active = pdfFontFamily === opt.id;
+                    return (
+                      <button
+                        key={opt.id}
+                        type="button"
+                        onClick={() => setPdfFontFamily(opt.id)}
+                        className={`rounded-xl border p-3 text-left transition-all cursor-pointer ${
+                          active
+                            ? 'border-[#6D28D9] bg-white dark:bg-slate-900 ring-2 ring-[#6D28D9]/25'
+                            : 'border-slate-200 dark:border-slate-800 bg-white/80 dark:bg-slate-900/60 hover:border-slate-400'
+                        }`}
+                      >
+                        <div className="flex items-baseline justify-between">
+                          <span className={`text-lg font-bold ${opt.previewClass}`}>Aa</span>
+                          <span className="text-[11px] font-semibold uppercase tracking-wider text-[#6D28D9] dark:text-violet-400">
+                            {opt.label}
+                          </span>
+                        </div>
+                        <div className="mt-1 text-[11px] text-slate-500 dark:text-slate-400">
+                          {opt.desc}
+                        </div>
+                      </button>
+                    );
+                  })}
+                </div>
+              </div>
+
+              <div className="space-y-2.5">
+                <div className="flex items-center justify-between gap-2">
+                  <div className="flex items-center gap-1.5 text-xs font-semibold text-slate-800 dark:text-slate-200">
+                    <SlidersHorizontal className="h-3.5 w-3.5 text-[#6D28D9] dark:text-violet-400" />
+                    <span>Taille des marges PDF</span>
+                  </div>
+                  <span className="font-mono text-xs font-semibold text-[#6D28D9] dark:text-violet-400 tabular-nums">
+                    {pdfMarginMm} mm
+                  </span>
+                </div>
+
+                <div className="flex flex-wrap gap-2">
+                  {marginPresets.map((preset) => {
+                    const active = pdfMarginMm === preset.mm;
+                    return (
+                      <button
+                        key={preset.mm}
+                        type="button"
+                        onClick={() => setPdfMarginMm(preset.mm)}
+                        className={`rounded-lg border px-3 py-1.5 text-xs font-medium transition-colors cursor-pointer ${
+                          active
+                            ? 'border-[#6D28D9] bg-[#6D28D9] text-white'
+                            : 'border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900 text-slate-700 dark:text-slate-300 hover:border-slate-400'
+                        }`}
+                      >
+                        {preset.label} ({preset.mm} mm)
+                      </button>
+                    );
+                  })}
+                </div>
+
+                <div className="flex items-center gap-3 pt-1">
+                  <span className="text-[11px] text-slate-500 font-mono">10 mm</span>
+                  <input
+                    type="range"
+                    min={10}
+                    max={40}
+                    step={1}
+                    value={pdfMarginMm}
+                    onChange={(e) => setPdfMarginMm(Number(e.target.value))}
+                    aria-label="Taille des marges en millimètres"
+                    className="flex-1 accent-[#6D28D9] cursor-pointer"
+                  />
+                  <span className="text-[11px] text-slate-500 font-mono">40 mm</span>
+                </div>
+              </div>
+
+              {/* PDF/A ISO Archival Standard */}
+              <div className="space-y-2.5 pt-2 border-t border-slate-200 dark:border-slate-800">
+                <div className="flex items-center justify-between gap-2">
+                  <div className="flex items-center gap-1.5 text-xs font-semibold text-slate-800 dark:text-slate-200">
+                    <ShieldCheck className="h-3.5 w-3.5 text-[#6D28D9] dark:text-violet-400" />
+                    <span>Archivage longue durée & Norme ISO (PDF/A)</span>
+                  </div>
+                  {pdfStandard !== 'standard' && (
+                    <span className="rounded-md bg-emerald-100 dark:bg-emerald-950/60 px-2 py-0.5 font-mono text-[10px] font-semibold text-emerald-800 dark:text-emerald-300">
+                      {pdfStandard} actif
+                    </span>
+                  )}
+                </div>
+
+                <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
+                  {(
+                    [
+                      { id: 'standard', label: 'PDF Standard', iso: 'Usage courant' },
+                      { id: 'PDF/A-1b', label: 'PDF/A-1b', iso: 'ISO 19005-1' },
+                      { id: 'PDF/A-2b', label: 'PDF/A-2b', iso: 'ISO 19005-2' },
+                      { id: 'PDF/A-3b', label: 'PDF/A-3b', iso: 'ISO 19005-3' },
+                    ] as const
+                  ).map((std) => {
+                    const active = pdfStandard === std.id;
+                    return (
+                      <button
+                        key={std.id}
+                        type="button"
+                        onClick={() => setPdfStandard(std.id)}
+                        className={`rounded-lg border px-2.5 py-2 text-left transition-colors cursor-pointer ${
+                          active
+                            ? 'border-[#6D28D9] bg-white dark:bg-slate-900 ring-2 ring-[#6D28D9]/25'
+                            : 'border-slate-200 dark:border-slate-800 bg-white/70 dark:bg-slate-900/60 hover:border-slate-400'
+                        }`}
+                      >
+                        <div className="text-xs font-semibold">{std.label}</div>
+                        <div className="text-[10px] font-mono text-slate-500 dark:text-slate-400">
+                          {std.iso}
+                        </div>
+                      </button>
+                    );
+                  })}
+                </div>
+
+                {pdfStandard !== 'standard' && (
+                  <p className="text-[11px] text-slate-600 dark:text-slate-300 leading-relaxed">
+                    Garantit l’archivage pérenne : polices TrueType intégralement incorporées, profil colorimétrique{' '}
+                    <span className="font-mono">sRGB IEC61966-2.1</span> et métadonnées XMP conformes{' '}
+                    <span className="font-mono">{pdfStandard}</span>
+                    {pdfStandard === 'PDF/A-1b' ? ' (couverture opaque sans transparence).' : '.'}
+                  </p>
+                )}
+              </div>
+            </div>
+
+            {/* Live PDF Page Proportion Preview */}
+            <div className="lg:col-span-4 flex flex-col items-center justify-center">
+              <div className="text-[11px] font-semibold uppercase tracking-wider text-slate-500 mb-2">
+                Aperçu mise en page PDF
+              </div>
+              <div
+                className="w-44 aspect-[210/297] rounded-lg border border-slate-300 dark:border-slate-700 bg-white text-slate-900 shadow-sm flex flex-col justify-between transition-all"
+                style={{ padding: `${previewPaddingPx}px` }}
+              >
+                <div className={`border border-dashed border-slate-200 flex-1 p-2 ${previewFontClass}`}>
+                  <div className="flex items-center justify-between gap-1">
+                    <span className="text-[8px] uppercase tracking-wider text-[#6D28D9] font-semibold">
+                      Chapitre 1
+                    </span>
+                    {pdfStandard !== 'standard' && (
+                      <span className="rounded bg-emerald-100 px-1 py-0.5 font-mono text-[6px] font-bold text-emerald-800">
+                        {pdfStandard}
+                      </span>
+                    )}
+                  </div>
+                  <div className="mt-0.5 text-[11px] font-bold leading-tight line-clamp-2">
+                    {selectedBook?.title || 'Titre de votre eBook'}
+                  </div>
+                  <p className="mt-1.5 text-[7.5px] leading-relaxed text-slate-600">
+                    La mise en page s’ajuste dynamiquement selon votre choix de police ({pdfFontFamily}) et de marges ({pdfMarginMm} mm).
+                  </p>
+                </div>
+                <div className="mt-1 flex justify-between text-[6.5px] text-slate-400 font-mono">
+                  <span>{selectedBook?.layoutConfig?.pageFormat || 'A5'}</span>
+                  <span>1 / 12</span>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <div className="flex flex-wrap items-center gap-3">
             {(['pdf', 'epub', 'html', 'docx'] as const).map((fmt) => (
               <button
                 key={fmt}
                 type="button"
                 disabled={!selectedBookId || busyFormat !== null}
                 onClick={() => triggerExport(fmt)}
-                className="inline-flex items-center gap-1.5 rounded-lg bg-[#0F172A] dark:bg-[#6D28D9] px-4 py-2 text-xs font-semibold text-white disabled:opacity-40 cursor-pointer"
+                className={`inline-flex items-center gap-1.5 rounded-lg px-4 py-2.5 text-xs font-semibold disabled:opacity-40 cursor-pointer ${
+                  fmt === 'pdf'
+                    ? 'bg-[#6D28D9] text-white hover:bg-violet-700'
+                    : 'bg-[#0F172A] dark:bg-slate-800 text-white hover:opacity-90'
+                }`}
               >
                 <Download className="h-3.5 w-3.5" />
-                <span>{busyFormat === fmt ? 'Génération…' : fmt.toUpperCase()}</span>
+                <span>
+                  {busyFormat === fmt
+                    ? 'Génération…'
+                    : fmt === 'pdf'
+                      ? `Générer ${pdfStandard === 'standard' ? 'PDF' : pdfStandard} (${pdfFontFamily.toUpperCase()} · ${pdfMarginMm} mm)`
+                      : fmt.toUpperCase()}
+                </span>
               </button>
             ))}
           </div>

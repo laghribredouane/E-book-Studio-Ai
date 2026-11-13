@@ -1,5 +1,5 @@
 import React, { useEffect, useState } from 'react';
-import { BookOpen, PenTool, Plus } from 'lucide-react';
+import { BookOpen, Image as ImageIcon, PenTool, Plus } from 'lucide-react';
 import { useApp } from '../contexts/AppContext';
 import { DashboardShell } from '../components/DashboardShell';
 import { BookCoverPreview } from '../components/BookCoverPreview';
@@ -34,14 +34,24 @@ export const DashboardOverview: React.FC = () => {
       title={t.dashboardTitle}
       breadcrumb="EBOOK STUDIO AI / Dashboard"
       action={
-        <button
-          type="button"
-          onClick={() => navigate({ name: 'studio', tab: 'setup' })}
-          className="inline-flex items-center gap-1.5 rounded-lg bg-[#0F172A] dark:bg-[#6D28D9] px-4 py-2 text-xs font-semibold text-white cursor-pointer whitespace-nowrap"
-        >
-          <Plus className="h-4 w-4" />
-          <span>{t.newEbook}</span>
-        </button>
+        <div className="flex items-center gap-2">
+          <button
+            type="button"
+            onClick={() => navigate({ name: 'studio', tab: 'setup', mode: 'image' })}
+            className="inline-flex items-center gap-1.5 rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 px-3 py-2 text-xs font-semibold hover:bg-slate-50 dark:hover:bg-slate-800 cursor-pointer whitespace-nowrap"
+          >
+            <ImageIcon className="h-3.5 w-3.5 text-[#6D28D9] dark:text-violet-400" />
+            <span className="hidden sm:inline">Depuis une image</span>
+          </button>
+          <button
+            type="button"
+            onClick={() => navigate({ name: 'studio', tab: 'setup' })}
+            className="inline-flex items-center gap-1.5 rounded-lg bg-[#0F172A] dark:bg-[#6D28D9] px-4 py-2 text-xs font-semibold text-white cursor-pointer whitespace-nowrap"
+          >
+            <Plus className="h-4 w-4" />
+            <span>{t.newEbook}</span>
+          </button>
+        </div>
       }
     >
       {/* KPI Grid */}
@@ -88,14 +98,24 @@ export const DashboardOverview: React.FC = () => {
               <p className="mt-1 text-sm text-slate-500 dark:text-slate-400">
                 Lancez votre premier manuscrit avec le plan structuré généré par Gemini.
               </p>
-              <button
-                type="button"
-                onClick={() => navigate({ name: 'studio', tab: 'setup' })}
-                className="mt-4 inline-flex items-center gap-1.5 rounded-lg bg-[#6D28D9] px-4 py-2 text-xs font-semibold text-white cursor-pointer"
-              >
-                <Plus className="h-4 w-4" />
-                <span>Créer mon premier eBook</span>
-              </button>
+              <div className="mt-4 flex flex-wrap items-center justify-center gap-2.5">
+                <button
+                  type="button"
+                  onClick={() => navigate({ name: 'studio', tab: 'setup' })}
+                  className="inline-flex items-center gap-1.5 rounded-lg bg-[#6D28D9] px-4 py-2 text-xs font-semibold text-white cursor-pointer"
+                >
+                  <Plus className="h-4 w-4" />
+                  <span>Créer mon premier eBook</span>
+                </button>
+                <button
+                  type="button"
+                  onClick={() => navigate({ name: 'studio', tab: 'setup', mode: 'image' })}
+                  className="inline-flex items-center gap-1.5 rounded-lg border border-slate-300 dark:border-slate-700 px-4 py-2 text-xs font-semibold cursor-pointer"
+                >
+                  <ImageIcon className="h-4 w-4 text-[#6D28D9] dark:text-violet-400" />
+                  <span>Créer depuis une image</span>
+                </button>
+              </div>
             </div>
           ) : (
             <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">

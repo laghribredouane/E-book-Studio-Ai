@@ -1,5 +1,5 @@
-import { NextFunction, Request, Response } from 'express';
-import { DecodedIdToken } from 'firebase-admin/auth';
+import type { NextFunction, Request, Response } from 'express';
+import type { DecodedIdToken } from 'firebase-admin/auth';
 import { adminAuth } from '../lib/firebase-admin.ts';
 import { getOrCreateProfile } from '../db/users.ts';
 

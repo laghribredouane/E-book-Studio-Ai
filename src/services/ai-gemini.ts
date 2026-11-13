@@ -1,4 +1,6 @@
-import { GoogleGenAI, Type } from '@google/genai';
+import fs from 'node:fs/promises';
+import path from 'node:path';
+import { GoogleGenAI, Type, type Content, type GenerateContentResponse } from '@google/genai';
 import { eq } from 'drizzle-orm';
 import { db } from '../db/index.ts';
 import { platformSettings } from '../db/schema.ts';
@@ -356,3 +358,261 @@ export async function generateBookIllustration(params: {
 
   throw new Error("Aucune image n'a été retournée par le fournisseur IA.");
 }
+
+export interface WriterChatMessage {
+  role: 'user' | 'assistant';
+  content: string;
+}
+
+export async function* streamWriterAssistantChat(params: {
+  message: string;
+  history: WriterChatMessage[];
+  bookContext: {
+    title?: string;
+    subtitle?: string;
+    subject?: string;
+    description?: string;
+    languageCode?: string;
+    categorySlug?: string;
+    targetAudience?: string;
+    writingStyle?: string;
+    chaptersOutline?: Array<{ chapterNumber: number; title: string }>;
+    activeChapterTitle?: string;
+    activeChapterExcerpt?: string;
+  };
+}): AsyncGenerator<string, { model: string }, unknown> {
+  assertGeminiConfigured();
+  const { textModel } = await getConfiguredModels();
+
+  const ctx = params.bookContext;
+  const outlineSummary =
+    ctx.chaptersOutline && ctx.chaptersOutline.length > 0
+      ? ctx.chaptersOutline.map((c) => `  ${c.chapterNumber}. ${c.title}`).join('\n')
+      : '  (Plan en cours de définition)';
+
+  const systemInstruction = `Tu es "AI Writer Assistant", un éditeur littéraire et coach d'écriture senior intégré à EBOOK STUDIO AI.
+Tu aides les auteurs en temps réel avec des conseils d'écriture concrets, le développement approfondi des personnages, la construction d'intrigues, le rythme narratif, la structure des chapitres et l'amélioration stylistique.
+
+Contexte du projet de livre actuel :
+- Titre : ${ctx.title || 'Sans titre'}
+- Sous-titre : ${ctx.subtitle || 'Aucun'}
+- Sujet : ${ctx.subject || 'Non précisé'}
+- Description : ${ctx.description || 'Non précisée'}
+- Catégorie : ${ctx.categorySlug || 'Général'}
+- Langue du livre : ${ctx.languageCode || 'fr'}
+- Public cible : ${ctx.targetAudience || 'Lecteurs généraux'}
+- Style rédactionnel : ${ctx.writingStyle || 'Éditorial soigné'}
+- Chapitres du livre :
+${outlineSummary}
+${
+  ctx.activeChapterTitle
+    ? `- Chapitre actuellement ouvert : ${ctx.activeChapterTitle}
+- Extrait du chapitre actif :
+${(ctx.activeChapterExcerpt || '').slice(0, 3000) || '(Chapitre encore vide)'}`
+    : ''
+}
+
+Directives :
+1. Réponds dans la langue du message de l'utilisateur (ou dans la langue du livre si ambigu).
+2. Sois précis, créatif, structuré et directement actionnable par rapport au livre ci-dessus.
+3. Si l'utilisateur demande des idées d'intrigue, de personnages ou de rédaction, propose des pistes concrètes prêtes à être intégrées au manuscrit.
+4. Utilise une mise en forme claire (paragraphes courts, listes à puces, gras léger) sans blabla inutile.`;
+
+  // Build valid alternating history starting with a 'user' turn as required by Gemini Chats API
+  const validHistory: Content[] = [];
+  for (const item of params.history.slice(-16)) {
+    const text = item.content.trim();
+    if (!text) continue;
+    const role: 'user' | 'model' = item.role === 'assistant' ? 'model' : 'user';
+    if (validHistory.length === 0 && role !== 'user') continue;
+    const last = validHistory[validHistory.length - 1];
+    if (last && last.role === role) {
+      last.parts = [{ text: `${last.parts?.[0]?.text || ''}\n\n${text}` }];
+    } else {
+      validHistory.push({ role, parts: [{ text }] });
+    }
+  }
+  // Ensure history ends on 'model' before calling sendMessageStream with the new user turn
+  if (validHistory.length > 0 && validHistory[validHistory.length - 1].role === 'user') {
+    validHistory.pop();
+  }
+
+  const chat = ai.chats.create({
+    model: textModel,
+    history: validHistory,
+    config: {
+      systemInstruction,
+    },
+  });
+
+  const stream = await chat.sendMessageStream({ message: params.message });
+  for await (const chunk of stream) {
+    const c = chunk as GenerateContentResponse;
+    if (c.text) {
+      yield c.text;
+    }
+  }
+
+  return { model: textModel };
+}
+
+async function resolveInspirationImagePart(imageInput: string): Promise<{ mimeType: string; data: string }> {
+  if (imageInput.startsWith('data:image/')) {
+    const match = imageInput.match(/^data:(image\/[a-zA-Z0-9.+-]+);base64,([A-Za-z0-9+/=\s]+)$/);
+    if (!match) {
+      throw new Error("Format d'image base64 invalide.");
+    }
+    return {
+      mimeType: match[1],
+      data: match[2].replace(/\s+/g, ''),
+    };
+  }
+
+  if (imageInput.startsWith('/src/assets/images/')) {
+    const assetsDir = path.resolve(process.cwd(), 'src/assets/images');
+    const resolved = path.resolve(process.cwd(), imageInput.replace(/^\/+/, ''));
+    if (!resolved.startsWith(assetsDir + path.sep)) {
+      throw new Error("Chemin d'image non autorisé.");
+    }
+    const buf = await fs.readFile(resolved);
+    const ext = path.extname(resolved).toLowerCase();
+    const mimeType = ext === '.png' ? 'image/png' : ext === '.webp' ? 'image/webp' : 'image/jpeg';
+    return {
+      mimeType,
+      data: buf.toString('base64'),
+    };
+  }
+
+  throw new Error("Source d'image non supportée. Importez un fichier PNG, JPEG ou WebP.");
+}
+
+export async function generateEbookFromImage(params: {
+  imageInput: string;
+  userHint?: string;
+  languageCode: string;
+  targetChapters: number;
+  targetLength: string;
+  availableCategories: string[];
+}) {
+  assertGeminiConfigured();
+  const { textModel } = await getConfiguredModels();
+  const imagePart = await resolveInspirationImagePart(params.imageInput);
+
+  const allowedCats = params.availableCategories.length > 0
+    ? params.availableCategories.join(', ')
+    : 'technology, architecture, science, travel, business, literature, education, wellness';
+
+  const prompt = `Tu es un directeur éditorial visionnaire et auteur primé.
+Observe attentivement cette image : son atmosphère, ses sujets, ses couleurs, sa composition, ses symboles et son histoire implicite.
+À partir de cette inspiration visuelle${params.userHint ? ` et de l'orientation donnée par l'auteur ("${params.userHint}")` : ''}, conçois un projet complet d'eBook original en langue "${params.languageCode}".
+
+Contraintes :
+- Choisis "categorySlug" uniquement parmi : ${allowedCats}.
+- Propose une palette de couleurs hexadécimales ("backgroundColor", "accentColor", "textColor") harmonisée avec l'image et offrant un contraste lisible pour la couverture.
+- Génère exactement ${params.targetChapters} chapitres structurés (longueur visée : ${params.targetLength}).
+- Rédige "chapterOneHtml" : un premier chapitre d'ouverture immersif (400 à 600 mots) utilisant uniquement les balises HTML <h2>, <h3>, <p>, <blockquote>, <strong>, <em> (sans H1 et sans markdown \`\`\`).
+- Tout le contenu textuel (sauf les codes hex et categorySlug) doit être rédigé dans la langue "${params.languageCode}".`;
+
+  const response = await ai.models.generateContent({
+    model: textModel,
+    contents: {
+      parts: [
+        { inlineData: imagePart },
+        { text: prompt },
+      ],
+    },
+    config: {
+      systemInstruction:
+        'Tu retournes uniquement un objet JSON valide conforme au schéma demandé, inspiré directement de l’image fournie.',
+      responseMimeType: 'application/json',
+      responseSchema: {
+        type: Type.OBJECT,
+        properties: {
+          visualAnalysis: {
+            type: Type.STRING,
+            description: 'Brève analyse éditoriale des éléments visuels, couleurs et ambiance perçus dans l’image.',
+          },
+          title: { type: Type.STRING },
+          subtitle: { type: Type.STRING },
+          subject: { type: Type.STRING },
+          description: { type: Type.STRING },
+          categorySlug: { type: Type.STRING },
+          targetAudience: { type: Type.STRING },
+          writingStyle: { type: Type.STRING },
+          backgroundColor: { type: Type.STRING },
+          accentColor: { type: Type.STRING },
+          textColor: { type: Type.STRING },
+          badgeText: { type: Type.STRING },
+          introduction: { type: Type.STRING },
+          conclusion: { type: Type.STRING },
+          chapters: {
+            type: Type.ARRAY,
+            items: {
+              type: Type.OBJECT,
+              properties: {
+                chapterNumber: { type: Type.INTEGER },
+                title: { type: Type.STRING },
+                summary: { type: Type.STRING },
+                sections: {
+                  type: Type.ARRAY,
+                  items: { type: Type.STRING },
+                },
+              },
+              required: ['chapterNumber', 'title', 'summary', 'sections'],
+            },
+          },
+          chapterOneHtml: { type: Type.STRING },
+        },
+        required: [
+          'visualAnalysis',
+          'title',
+          'subtitle',
+          'subject',
+          'description',
+          'categorySlug',
+          'targetAudience',
+          'writingStyle',
+          'backgroundColor',
+          'accentColor',
+          'textColor',
+          'badgeText',
+          'introduction',
+          'conclusion',
+          'chapters',
+          'chapterOneHtml',
+        ],
+      },
+    },
+  });
+
+  const parsed = JSON.parse((response.text ?? '{}').trim()) as {
+    visualAnalysis: string;
+    title: string;
+    subtitle: string;
+    subject: string;
+    description: string;
+    categorySlug: string;
+    targetAudience: string;
+    writingStyle: string;
+    backgroundColor: string;
+    accentColor: string;
+    textColor: string;
+    badgeText: string;
+    introduction: string;
+    conclusion: string;
+    chapters: Array<{
+      chapterNumber: number;
+      title: string;
+      summary: string;
+      sections: string[];
+    }>;
+    chapterOneHtml: string;
+  };
+
+  return {
+    ...parsed,
+    model: textModel,
+  };
+}
+
+
