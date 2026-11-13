@@ -1,0 +1,6 @@
+{
+  "name": "EBOOK STUDIO AI",
+  "description": "Plateforme SaaS tout-en-un de bibliothèque numérique et de création d'eBooks assistée par IA avec rédaction de chapitres, illustrations, conception de couvertures et export PDF/EPUB 3.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
